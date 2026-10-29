@@ -1,0 +1,54 @@
+  module mul_seq (
+    input  wire         clk,
+    input  wire         reset,      // reset asincrono, activo en alto
+    input  wire         start,
+    input  wire [63:0]  a,
+    input  wire [39:0]  b,
+    output wire [103:0] product,
+    output reg          done
+);
+
+reg [103:0] acc;
+reg [103:0] a_sh;
+reg [39:0]  b_sh;
+reg [5:0]   cnt;
+reg         running;
+
+assign product = acc;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        acc     <= 104'd0;
+        a_sh    <= 104'd0;
+        b_sh    <= 40'd0;
+        cnt     <= 6'd0;
+        running <= 1'b0;
+        done    <= 1'b0;
+    end else begin
+        done <= 1'b0;
+
+        if (!running) begin
+            if (start) begin
+                acc     <= 104'd0;
+                a_sh    <= {40'd0, a};
+                b_sh    <= b;
+                cnt     <= 6'd0;
+                running <= 1'b1;
+            end
+        end else begin
+            if (b_sh[0])
+                acc <= acc + a_sh;
+            a_sh <= {a_sh[102:0], 1'b0};
+            b_sh <= {1'b0, b_sh[39:1]};
+
+            if (cnt == 6'd39) begin
+                running <= 1'b0;
+                done    <= 1'b1;
+            end else begin
+                cnt <= cnt + 6'd1;
+            end
+        end
+    end
+end
+
+endmodule
