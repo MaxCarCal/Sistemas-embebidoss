@@ -1,0 +1,359 @@
+module top_uart_multi_de10lite #(
+    parameter CLK_FREQ   = 50000000,
+    parameter BAUD_RATE  = 9600,
+    parameter TIMEOUT_MS = 100
+)(
+    input  wire       CLOCK_50,   // MAX10_CLK1_50 (PIN_P11)
+    input  wire       RESET_N,    // KEY0, activo en bajo (PIN_B8)
+    input  wire [1:0] SW,         // selector de modo (SW0 = PIN_C10, SW1 = PIN_C11)
+    input  wire       UART_RX,    // desde GPIO17 (TX) del ESP32
+    output wire       UART_TX     // hacia GPIO16 (RX) del ESP32
+);
+
+localparam integer TIMEOUT_CYCLES = (CLK_FREQ / 1000) * TIMEOUT_MS;
+
+wire reset;
+assign reset = ~RESET_N;
+
+// ---------------- Sincronizador de los switches ----------------
+reg [1:0] sw_s1;
+reg [1:0] sw_s2;
+
+always @(posedge CLOCK_50 or posedge reset) begin
+    if (reset) begin
+        sw_s1 <= 2'b00;
+        sw_s2 <= 2'b00;
+    end else begin
+        sw_s1 <= SW;
+        sw_s2 <= sw_s1;
+    end
+end
+
+// ---------------- UART ----------------
+wire [7:0] rx_data;
+wire       rx_done;
+reg  [7:0] tx_data;
+reg        tx_start;
+wire       tx_busy;
+
+uart_rx #(.CLK_FREQ(CLK_FREQ), .BAUD_RATE(BAUD_RATE)) RX0 (
+    .clk(CLOCK_50), .reset(reset), .rx(UART_RX),
+    .data_out(rx_data), .data_valid(rx_done)
+);
+
+uart_tx #(.CLK_FREQ(CLK_FREQ), .BAUD_RATE(BAUD_RATE)) TX0 (
+    .clk(CLOCK_50), .reset(reset), .tx_start(tx_start),
+    .data_in(tx_data), .tx(UART_TX), .busy(tx_busy)
+);
+
+// ---------------- Multiplicador secuencial ----------------
+reg          mul_start;
+reg  [63:0]  mul_a;
+reg  [39:0]  mul_b;
+wire [103:0] mul_product;
+wire         mul_done;
+
+mul_seq MUL0 (
+    .clk(CLOCK_50), .reset(reset), .start(mul_start),
+    .a(mul_a), .b(mul_b),
+    .product(mul_product), .done(mul_done)
+);
+
+// ---------------- Estados ----------------
+localparam [4:0] S_WAIT_BASE = 5'd0,
+                 S_WAIT_NUM  = 5'd1,
+                 S_WAIT_DEN  = 5'd2,
+                 S_DIV       = 5'd3,    // n = p div q  (restas sucesivas)
+                 S_INIT_FRAC = 5'd4,
+                 S_FRAC_BIT  = 5'd5,    // siguiente bit de f por division larga
+                 S_SQRT      = 5'd6,    // Y = sqrt(Y)  (36 ciclos)
+                 S_MUL_START = 5'd7,    // F = F * Y   (si el bit es 1)
+                 S_MUL_WAIT  = 5'd8,
+                 S_NEXT_BIT  = 5'd9,
+                 S_INT_INIT  = 5'd10,
+                 S_INT_LOOP  = 5'd11,   // R = R * base, n veces
+                 S_INT_WAIT  = 5'd12,
+                 S_SEND_LOAD = 5'd13,
+                 S_SEND      = 5'd14,
+                 S_TX_HI     = 5'd15,
+                 S_TX_LO     = 5'd16;
+
+reg [4:0]  state;
+reg [1:0]  mode_reg;       // modo capturado al llegar el primer byte
+reg [7:0]  base_reg;
+reg [7:0]  num_reg;        // p (o el exponente en modo entero)
+reg [7:0]  den_reg;        // q (vale 1 en modo entero)
+reg [8:0]  rem;            // residuo de la division
+reg [7:0]  n_left;         // parte entera del exponente (n)
+reg [5:0]  bit_cnt;        // bit fraccionario actual (0..31)
+reg        cur_bit;
+
+reg [39:0] Y;              // Q8.32: base^(2^-i)
+reg [39:0] F;              // Q8.32: base^f acumulado
+
+// Raiz cuadrada digito a digito
+reg [71:0] sq_rad;         // radicando = Y << 32
+reg [41:0] sq_rem;
+reg [35:0] sq_root;
+reg [5:0]  sq_cnt;
+
+reg [63:0] R;              // resultado Q32.32
+reg [7:0]  status;
+reg [71:0] tx_shift;       // se envia el byte bajo primero
+reg [3:0]  send_cnt;
+reg [3:0]  send_last;      // indice del ultimo byte a enviar
+reg [23:0] timeout_cnt;
+
+// Division larga: r2 = 2*rem; si r2 >= q el bit vale 1
+wire [9:0] r2     = {rem, 1'b0};
+wire [9:0] den10  = {2'b00, den_reg};
+wire [9:0] r2_sub = r2 - den10;
+
+// Un paso de la raiz cuadrada
+wire [41:0] sq_rem_n  = {sq_rem[39:0], sq_rad[71:70]};
+wire [41:0] sq_trial  = {4'b0000, sq_root, 2'b01};
+wire        sq_ge     = (sq_rem_n >= sq_trial);
+wire [35:0] sq_root_n = {sq_root[34:0], sq_ge};
+
+always @(posedge CLOCK_50 or posedge reset) begin
+    if (reset) begin
+        state       <= S_WAIT_BASE;
+        mode_reg    <= 2'b00;
+        base_reg    <= 8'd0;
+        num_reg     <= 8'd0;
+        den_reg     <= 8'd0;
+        rem         <= 9'd0;
+        n_left      <= 8'd0;
+        bit_cnt     <= 6'd0;
+        cur_bit     <= 1'b0;
+        Y           <= 40'd0;
+        F           <= 40'd0;
+        sq_rad      <= 72'd0;
+        sq_rem      <= 42'd0;
+        sq_root     <= 36'd0;
+        sq_cnt      <= 6'd0;
+        R           <= 64'd0;
+        status      <= 8'd0;
+        tx_shift    <= 72'd0;
+        send_cnt    <= 4'd0;
+        send_last   <= 4'd0;
+        timeout_cnt <= 24'd0;
+        tx_data     <= 8'd0;
+        tx_start    <= 1'b0;
+        mul_start   <= 1'b0;
+        mul_a       <= 64'd0;
+        mul_b       <= 40'd0;
+    end else begin
+        tx_start  <= 1'b0;   // pulsos de 1 ciclo por defecto
+        mul_start <= 1'b0;
+
+        case (state)
+
+            // ---- Primer byte: aqui se decide el modo ----
+            S_WAIT_BASE: begin
+                if (rx_done) begin
+                    base_reg    <= rx_data;
+                    mode_reg    <= sw_s2;
+                    timeout_cnt <= 24'd0;
+                    if (sw_s2 == 2'b00) begin
+                        // MODO ECO: responde dato + 1 (255 + 1 = 0)
+                        tx_shift  <= {64'd0, rx_data + 8'd1};
+                        send_cnt  <= 4'd0;
+                        send_last <= 4'd0;
+                        state     <= S_SEND;
+                    end else begin
+                        state <= S_WAIT_NUM;
+                    end
+                end
+            end
+
+            // ---- Segundo byte: exponente (modo 01) o p (modo 1x) ----
+            S_WAIT_NUM: begin
+                if (rx_done) begin
+                    num_reg     <= rx_data;
+                    timeout_cnt <= 24'd0;
+                    if (mode_reg == 2'b01) begin
+                        // MODO ENTERO: equivale a p = exp, q = 1
+                        den_reg <= 8'd1;
+                        rem     <= {1'b0, rx_data};
+                        n_left  <= 8'd0;
+                        status  <= 8'd0;
+                        state   <= S_DIV;
+                    end else begin
+                        state <= S_WAIT_DEN;
+                    end
+                end else if (timeout_cnt == TIMEOUT_CYCLES - 1) begin
+                    state <= S_WAIT_BASE;
+                end else begin
+                    timeout_cnt <= timeout_cnt + 24'd1;
+                end
+            end
+
+            // ---- Tercer byte: q (solo modo fraccionario) ----
+            S_WAIT_DEN: begin
+                if (rx_done) begin
+                    den_reg <= rx_data;
+                    rem     <= {1'b0, num_reg};
+                    n_left  <= 8'd0;
+                    status  <= 8'd0;
+                    state   <= S_DIV;
+                end else if (timeout_cnt == TIMEOUT_CYCLES - 1) begin
+                    state <= S_WAIT_BASE;
+                end else begin
+                    timeout_cnt <= timeout_cnt + 24'd1;
+                end
+            end
+
+            // ---- n = p div q, rem = p mod q ----
+            S_DIV: begin
+                if (den_reg == 8'd0) begin
+                    status <= 8'd2;                 // denominador cero
+                    R      <= 64'd0;
+                    state  <= S_SEND_LOAD;
+                end else if (rem >= {1'b0, den_reg}) begin
+                    rem    <= rem - {1'b0, den_reg};
+                    n_left <= n_left + 8'd1;
+                end else begin
+                    state  <= S_INIT_FRAC;
+                end
+            end
+
+            // ---- Parte fraccionaria: base^f ----
+            S_INIT_FRAC: begin
+                Y       <= {base_reg, 32'd0};       // base en Q8.32
+                F       <= 40'h01_0000_0000;        // 1.0 en Q8.32
+                bit_cnt <= 6'd0;
+                if (rem == 9'd0)
+                    state <= S_INT_INIT;            // f = 0: no hay fraccion
+                else
+                    state <= S_FRAC_BIT;
+            end
+
+            S_FRAC_BIT: begin
+                if (r2 >= den10) begin
+                    cur_bit <= 1'b1;
+                    rem     <= r2_sub[8:0];
+                end else begin
+                    cur_bit <= 1'b0;
+                    rem     <= r2[8:0];
+                end
+                sq_rad  <= {Y, 32'd0};              // sqrt(Y) en Q8.32 = isqrt(Y<<32)
+                sq_rem  <= 42'd0;
+                sq_root <= 36'd0;
+                sq_cnt  <= 6'd0;
+                state   <= S_SQRT;
+            end
+
+            S_SQRT: begin
+                sq_rem  <= sq_ge ? (sq_rem_n - sq_trial) : sq_rem_n;
+                sq_root <= sq_root_n;
+                sq_rad  <= {sq_rad[69:0], 2'b00};
+                if (sq_cnt == 6'd35) begin
+                    Y     <= {4'b0000, sq_root_n};
+                    state <= cur_bit ? S_MUL_START : S_NEXT_BIT;
+                end else begin
+                    sq_cnt <= sq_cnt + 6'd1;
+                end
+            end
+
+            S_MUL_START: begin
+                mul_a     <= {24'd0, F};
+                mul_b     <= Y;
+                mul_start <= 1'b1;
+                state     <= S_MUL_WAIT;
+            end
+
+            S_MUL_WAIT: begin
+                if (mul_done) begin
+                    F     <= mul_product[71:32];    // Q16.64 -> Q8.32
+                    state <= S_NEXT_BIT;
+                end
+            end
+
+            S_NEXT_BIT: begin
+                if (rem == 9'd0 || bit_cnt == 6'd31) begin
+                    state <= S_INT_INIT;            // ya no quedan bits en 1
+                end else begin
+                    bit_cnt <= bit_cnt + 6'd1;
+                    state   <= S_FRAC_BIT;
+                end
+            end
+
+            // ---- Parte entera: R = base^f * base^n ----
+            S_INT_INIT: begin
+                R     <= {24'd0, F};                // Q8.32 -> Q32.32
+                state <= S_INT_LOOP;
+            end
+
+            S_INT_LOOP: begin
+                if (n_left == 8'd0) begin
+                    state <= S_SEND_LOAD;           // status ya vale 0
+                end else begin
+                    mul_a     <= R;
+                    mul_b     <= {32'd0, base_reg};
+                    mul_start <= 1'b1;
+                    state     <= S_INT_WAIT;
+                end
+            end
+
+            S_INT_WAIT: begin
+                if (mul_done) begin
+                    if (mul_product[103:64] != 40'd0) begin
+                        status <= 8'd1;             // desbordamiento
+                        R      <= 64'hFFFF_FFFF_FFFF_FFFF;
+                        state  <= S_SEND_LOAD;
+                    end else begin
+                        R      <= mul_product[63:0];
+                        n_left <= n_left - 8'd1;
+                        state  <= S_INT_LOOP;
+                    end
+                end
+            end
+
+            // ---- Preparar la respuesta segun el modo ----
+            S_SEND_LOAD: begin
+                if (mode_reg == 2'b01) begin
+                    // Entero: 4 bytes, parte entera de R (o 0xFFFFFFFF si desbordo)
+                    tx_shift  <= {40'd0, (status == 8'd1) ? 32'hFFFF_FFFF : R[63:32]};
+                    send_last <= 4'd3;
+                end else begin
+                    // Fraccionario: [estado] + 8 bytes Q32.32
+                    tx_shift  <= {R, status};
+                    send_last <= 4'd8;
+                end
+                send_cnt <= 4'd0;
+                state    <= S_SEND;
+            end
+
+            // ---- Envio byte a byte ----
+            S_SEND: begin
+                if (!tx_busy) begin
+                    tx_data  <= tx_shift[7:0];
+                    tx_start <= 1'b1;
+                    state    <= S_TX_HI;
+                end
+            end
+
+            S_TX_HI: begin
+                if (tx_busy)
+                    state <= S_TX_LO;
+            end
+
+            S_TX_LO: begin
+                if (!tx_busy) begin
+                    if (send_cnt == send_last) begin
+                        state <= S_WAIT_BASE;
+                    end else begin
+                        send_cnt <= send_cnt + 4'd1;
+                        tx_shift <= {8'd0, tx_shift[71:8]};
+                        state    <= S_SEND;
+                    end
+                end
+            end
+
+            default: state <= S_WAIT_BASE;
+        endcase
+    end
+end
+
+endmodule
