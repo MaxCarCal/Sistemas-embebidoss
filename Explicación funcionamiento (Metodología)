@@ -1,0 +1,187 @@
+### Práctica 4 · Comunicación UART bidireccional FPGA DE10-Lite ↔ PC (puente ESP32)
+
+Laboratorio de Sistemas Embebidos · Universidad de Las Américas Puebla (UDLAP)
+
+Una computadora (MATLAB o Python) se comunica con una FPGA DE10-Lite por UART a 9600 baudios, 8N1. Un ESP32 funciona como puente USB–UART, así que no hace falta ningún convertidor USB–serial dedicado. La FPGA recibe bytes, los procesa y responde.
+
+Además de la práctica base (eco `dato + 1`), el diseño incluye el punto extra: una calculadora de potencias `base ^ exponente`, tanto con exponente entero como con exponente fraccionario `p/q` (por ejemplo, `5 ^ (6/7)`).
+
+```text
+PC (MATLAB / Python) ⇄ USB ⇄ ESP32 ⇄ UART 3.3 V ⇄ FPGA DE10-Lite
+                              GPIO16/17            UART_TX / UART_RX
+```
+
+### Modos de operación
+
+Un único módulo superior (`top_uart_multi_de10lite`) atiende las tres funciones. El modo se elige con los interruptores SW1 y SW0 de la tarjeta (abajo = 0, arriba = 1). Se lee al llegar el primer byte de cada petición, así que se puede cambiar con la placa funcionando.
+
+| SW1 SW0   | Modo                          | PC → FPGA        | FPGA → PC                       | Script de MATLAB       | Script de Python        |
+| --------- | ----------------------------- | ---------------- | ------------------------------- | ---------------------- | ----------------------- |
+| 0 0       | Eco: dato + 1                 | 1 byte           | 1 byte (255 → 0)                | bidireccional_matlab.m | comunicacion_serial.py  |
+| 0 1       | Potencia entera b^e           | 2 bytes: b, e    | 4 bytes (uint32, little-endian) | potencia_matlab.m      | potencia_serial.py      |
+| 1 0 / 1 1 | Potencia fraccionaria b^(p/q) | 3 bytes: b, p, q | 9 bytes: estado + Q32.32        | potencia_frac_matlab.m | potencia_frac_serial.py |
+
+Con los dos interruptores abajo (estado normal de la tarjeta) funciona la práctica base.
+
+### Formato de las respuestas
+
+Modo `01` (entera): 4 bytes, entero sin signo de 32 bits, byte menos significativo primero. Si el resultado no cabe en 32 bits, regresa `0xFFFFFFFF`.
+
+Modo `10`/`11` (fraccionaria): 9 bytes.
+
+| Byte | Contenido                                                                              |
+| ---- | -------------------------------------------------------------------------------------- |
+| 1    | Estado: 0 correcto, 1 desbordamiento (no cabe en 32 bits enteros), 2 denominador q = 0 |
+| 2–5  | Parte fraccionaria (cada unidad vale 2⁻³²), little-endian                              |
+| 6–9  | Parte entera, little-endian                                                            |
+
+`valor = entero + fracción / 2³²`. Por ejemplo, en MATLAB:
+
+```matlab
+frac   = sum(double(datos(2:5)) .* 256 .^ (0:3)) / 2^32;
+entero = sum(double(datos(6:9)) .* 256 .^ (0:3));
+valor  = entero + frac;
+```
+
+Convenciones: `x^0 = 1` (incluido `0^0 = 1`) y `0^(p/q) = 0` si `p > 0`.
+
+### Archivos del proyecto
+
+| Archivo                    | Descripción                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------- |
+| uart_rx.v                  | Receptor UART 8N1: sincronizador de 2 flip-flops y muestreo al centro de cada bit |
+| uart_tx.v                  | Transmisor UART 8N1 (máquina de estados)                                          |
+| mul_seq.v                  | Multiplicador secuencial por suma y desplazamiento (64 × 40 bits, 40 ciclos)      |
+| top_uart_multi_de10lite.v  | Módulo superior: eco, potencia entera y potencia fraccionaria                     |
+| tb_top_uart_multi.v        | Testbench de los tres modos (Icarus Verilog / ModelSim)                           |
+| pin_assignments.qsf        | Asignación de pines para Quartus                                                  |
+| arduino_esp32_bridge       | Programa del ESP32 (puente transparente PC ↔ FPGA)                                |
+| Scripts de MATLAB / Python | Los de la tabla de modos, más transmision_matlab.m y recepcion_matlab.m           |
+| Practica4_Reporte.pdf      | Reporte de laboratorio                                                            |
+
+> Ajusta esta tabla a los nombres que tengan los archivos en el repositorio.
+
+### Conexión física
+
+La FPGA y el ESP32 trabajan a 3.3 V, así que se conectan directamente. La conexión es cruzada y la tierra es común.
+
+| ESP32        | Cable | FPGA DE10-Lite                                  |
+| ------------ | ----- | ----------------------------------------------- |
+| GPIO17 (TX2) | →     | UART_RX, pin 1 del header JP1 (GPIO_0, PIN_V10) |
+| GPIO16 (RX2) | ←     | UART_TX, pin 2 del header JP1 (GPIO_1, PIN_W10) |
+| GND          | —     | GND, pin 12 del header JP1                      |
+
+> Advertencia: El pin 11 del header JP1 es de 5 V, justo al lado del GND (pin 12). Verifica el cable de tierra para no mandar 5 V al ESP32.
+
+### Pines de la FPGA (10M50DAF484C7G)
+
+| Señal    | Recurso               | Pin | Estándar              |
+| -------- | --------------------- | --- | --------------------- |
+| CLOCK_50 | MAX10_CLK1_50         | P11 | 3.3-V LVTTL           |
+| RESET_N  | KEY0 (activo en bajo) | B8  | 3.3 V Schmitt Trigger |
+| SW[0]    | SW0                   | C10 | 3.3-V LVTTL           |
+| SW[1]    | SW1                   | C11 | 3.3-V LVTTL           |
+| UART_RX  | GPIO_0                | V10 | 3.3-V LVTTL           |
+| UART_TX  | GPIO_1                | W10 | 3.3-V LVTTL           |
+
+> `RESET_N` debe ir en PIN_B8 (KEY0). PIN_C10 es el interruptor SW0: si el reset se asigna ahí, la FPGA queda en reset mientras SW0 esté abajo y nunca responde.
+
+### Cómo funciona
+
+### UART en la FPGA
+
+A 50 MHz y 9600 baudios, cada bit dura `50 000 000 / 9600 ≈ 5208` ciclos de reloj (error de 0.0064 %).
+
+* Transmisor: carga el byte, baja la línea para el bit de inicio y cambia de bit cada 5208 ciclos (8 datos, el menos significativo primero, y bit de paro). La señal `busy` indica que está ocupado.
+
+* Receptor: pasa `rx` por dos flip-flops (la señal es asíncrona). Al detectar el flanco de bajada espera medio bit para confirmar el inicio y luego muestrea cada dato en su centro. Al final verifica que el bit de paro valga 1 y emite `data_valid` durante un ciclo.
+
+### Potencia fraccionaria `b^(p/q)`
+
+La FPGA separa el exponente en `p/q = n + f` (con `n = p div q` y `f = (p mod q)/q` entre 0 y 1) y calcula:
+
+```text
+b^(p/q) = b^f · b^n
+```
+
+* `b^f`: `f` se expande en binario, `f = β₁/2 + β₂/4 + β₃/8 + …` (los bits salen por división larga). `b^(2⁻ⁱ)` es la raíz cuadrada aplicada `i` veces a `b`, así que `b^f` es el producto de esas raíces para los bits de `f` que valen 1. Solo se necesitan raíces cuadradas (dígito a dígito) y multiplicaciones.
+
+* `b^n`: `n` multiplicaciones por `b`, detectando el desbordamiento de 32 bits enteros.
+
+* Aritmética: punto fijo Q32.32. La potencia entera es el caso `q = 1` del mismo motor.
+
+Precisión: el error relativo es menor que 10⁻⁸. Los casos exactos salen exactos (`4^(1/2) = 2`), pero otros dan un pequeño error (`8^(2/3)` ≈ 3.999999979, `5^(6/7)` ≈ 3.97298700 frente a 3.97298702 exacto).
+
+### Recuperación por timeout
+
+Si llegan la base (y `p`) pero falta algún byte durante 100 ms, la FPGA descarta la petición y vuelve a esperar una nueva. Así un byte perdido no desincroniza el sistema. Mientras calcula o transmite, ignora los bytes que lleguen.
+
+### Uso paso a paso
+
+### 1\. FPGA (Quartus Prime)
+
+* Crea un proyecto con el dispositivo 10M50DAF484C7G y `top_uart_multi_de10lite` como entidad superior.
+
+* Agrega `top_uart_multi_de10lite.v`, `uart_rx.v`, `uart_tx.v` y `mul_seq.v`.
+
+* Importa los pines: Assignments → Import Assignments → `pin_assignments.qsf`.
+
+* Compila y programa el `.sof` desde Tools → Programmer (USB-Blaster, modo JTAG).
+
+### 2\. ESP32 (Arduino IDE)
+
+Carga el programa del puente (`arduino_esp32_bridge`): UART2 con GPIO16 (RX) y GPIO17 (TX) a 9600 8N1, reenviando todo byte en ambos sentidos.
+
+### 3\. PC
+
+* Averigua el puerto COM del ESP32 y cámbialo en el script (variable `PORT`).
+
+* Pon SW1 y SW0 según el modo y ejecuta el script correspondiente (tabla de modos).
+
+* Para la potencia fraccionaria, el exponente se escribe como `6/7` o como un entero.
+
+Python: `pip install pyserial`.
+
+MATLAB: requiere R2019b o posterior (objeto `serialport`).
+
+Al abrir el puerto, el ESP32 puede reiniciarse y mandar su mensaje de arranque. Los scripts esperan 2 s y vacían el búfer (`flush` en MATLAB, `reset_input_buffer()` en Python); sin eso, el primer byte leído sería basura.
+
+### Simulación
+
+Con [Icarus Verilog](https://steveicarus.github.io/iverilog/?utm_source=chatgpt.com):
+
+```bash
+iverilog -g2005 -o sim tb_top_uart_multi.v top_uart_multi_de10lite.v mul_seq.v uart_rx.v uart_tx.v
+vvp sim
+```
+
+El testbench simula ~500 ms de operación (eco, potencia entera, potencia fraccionaria, cambio de modo y timeouts), así que puede tardar un rato. Cada caso imprime `[OK]` o `[FALLO]`, y al final aparece `TODAS LAS PRUEBAS PASARON`.
+
+En ModelSim: compila los cinco `.v`, simula `tb_top_uart_multi` y ejecuta `run -all`. Para generar ondas, compila con `-DDUMP`.
+
+### Solución de problemas
+
+| Síntoma                            | Causa probable                                                                                                                                            |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "No se recibió respuesta"          | La FPGA se queda esperando más bytes: el modo de los switches no coincide con el script (por ejemplo, SW en 10 y el script de eco, que manda 1 solo byte) |
+| La FPGA nunca responde             | RESET_N mal asignado (debe ser PIN_B8), pines sin asignar, o FPGA no programada (el LED CONF_DONE debe estar encendido)                                   |
+| Respuestas aleatorias o ruido      | Falta la tierra común, TX/RX sin cruzar o una línea suelta                                                                                                |
+| La primera respuesta es incorrecta | Falta vaciar el búfer después de abrir el puerto (mensaje de arranque del ESP32)                                                                          |
+| 67 regresa 135 en lugar de 68      | Se programó el uart_rx original del enunciado, que muestrea el primer bit en el bit de inicio y desplaza el byte                                          |
+| Error al abrir el COM              | Otro programa (Arduino IDE, otro script) tiene el puerto abierto                                                                                          |
+
+Prueba rápida del ESP32 solo: desconecta la FPGA y une GPIO16 con GPIO17. El script de eco debe devolver el mismo número que envías.
+
+### Limitaciones
+
+* Exponentes no negativos, con `p` y `q` entre 0 y 255.
+
+* Resultado entero acotado a 32 bits; si no cabe se avisa con el estado `1` (o `0xFFFFFFFF` en el modo entero).
+
+* Precisión de aproximadamente 10⁻⁸ de error relativo en las potencias fraccionarias.
+
+* Los bytes que llegan mientras la FPGA calcula o transmite se ignoran: se espera la respuesta antes de enviar otra petición.
+
+### Autores
+
+Maylin Espinosa Andrade (186109) y Maximiliano Carmona Canales (184486)
